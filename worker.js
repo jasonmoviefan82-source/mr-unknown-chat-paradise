@@ -138,17 +138,18 @@ export class ChatRoom {
     }
   }
 
-  sendUsers() {
-    const users = this.ctx.getWebSockets().map(socket => {
-      const attachment = socket.deserializeAttachment() || {};
-      return attachment.username || "Guest";
-    });
+ sendUsers() {
+    const users = this.ctx.getWebSockets()
+        .filter(socket => socket.readyState === WebSocket.OPEN)
+        .map(socket => {
+            const attachment = socket.deserializeAttachment() || {};
+            return attachment.username || "Guest";
+        });
 
     this.broadcast({
-      type: "users",
-      users
+        type: "users",
+        users
     });
-  }
 }
 
 const HTML = `<!DOCTYPE html>
