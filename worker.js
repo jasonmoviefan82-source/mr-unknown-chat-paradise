@@ -2,36 +2,33 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/health") {
+      return Response.json({ status: "online" });
+    }
+
     if (url.pathname === "/ws") {
       if (!env.CHAT_ROOMS) {
-        return new Response("Chat binding is not configured.", { status: 503 });
+        return new Response("CHAT_ROOMS binding is missing", { status: 500 });
+      }
+
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("WebSocket upgrade required", { status: 426 });
       }
 
       const room = (url.searchParams.get("room") || "Welcome Lounge").slice(0, 50);
       const username = (url.searchParams.get("username") || "Guest").slice(0, 24);
 
       const id = env.CHAT_ROOMS.idFromName(room);
-      return env.CHAT_ROOMS.get(id).fetch(requestWithIdentity(request, username));
-    }
+      const stub = env.CHAT_ROOMS.get(id);
 
-    if (url.pathname === "/health") {
-      return Response.json({ status: "online", site: "MR UNKNOWN'S CHAT PARADISE" });
+      return stub.fetch(request);
     }
 
     return new Response(HTML, {
-      headers: {
-        "Content-Type": "text/html;charset=UTF-8",
-        "X-Content-Type-Options": "nosniff"
-      }
+      headers: { "Content-Type": "text/html;charset=UTF-8" }
     });
   }
 };
-
-function requestWithIdentity(request, username) {
-  const headers = new Headers(request.headers);
-  headers.set("X-Chat-Username", username);
-  return new Request(request, { headers });
-}
 
 export class ChatRoom {
   constructor(ctx, env) {
@@ -41,19 +38,24 @@ export class ChatRoom {
 
   async fetch(request) {
     if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("WebSocket connection required.", { status: 426 });
+      return new Response("WebSocket required", { status: 426 });
     }
+
+    const url = new URL(request.url);
+    const username = (url.searchParams.get("username") || "Guest").slice(0, 24);
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
 
-    const username = request.headers.get("X-Chat-Username") || "Guest";
-
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ username });
 
-    const history = await this.ctx.storage.get("history") || [];
+    server.serializeAttachment({
+      username,
+      lastSeen: Date.now()
+    });
+
+    const history = await this.ctx.storage.get("messages") || [];
 
     server.send(JSON.stringify({
       type: "history",
@@ -66,6 +68,7 @@ export class ChatRoom {
     }, server);
 
     this.sendUsers();
+    await this.scheduleCleanup();
 
     return new Response(null, {
       status: 101,
@@ -82,348 +85,521 @@ export class ChatRoom {
       return;
     }
 
-    if (data.type !== "message") return;
-
     const attachment = socket.deserializeAttachment() || {};
-    const username = attachment.username || "Guest";
-    const text = String(data.text || "").trim().slice(0, 500);
+    attachment.lastSeen = Date.now();
+    socket.serializeAttachment(attachment);
 
+    if (data.type === "ping") {
+      socket.send(JSON.stringify({ type: "pong" }));
+      await this.scheduleCleanup();
+      return;
+    }
+
+    if (data.type !== "chat") return;
+
+    const text = String(data.text || "").trim().slice(0, 500);
     if (!text) return;
 
-    const entry = {
-      username,
+    const chatMessage = {
+      type: "message",
+      username: attachment.username || "Guest",
       text,
-      time: new Date().toISOString()
+      time: new Date().toLocaleTimeString()
     };
 
-    const history = await this.ctx.storage.get("history") || [];
-    history.push(entry);
+    const messages = await this.ctx.storage.get("messages") || [];
+    messages.push(chatMessage);
 
-    while (history.length > 100) history.shift();
+    await this.ctx.storage.put("messages", messages.slice(-100));
 
-    await this.ctx.storage.put("history", history);
-
-    this.broadcast({
-      type: "message",
-      message: entry
-    });
+    this.broadcast(chatMessage);
   }
 
-  webSocketClose(socket) {
+  async webSocketClose(socket, code, reason, wasClean) {
     const attachment = socket.deserializeAttachment() || {};
+
     this.broadcast({
       type: "notice",
       text: (attachment.username || "A member") + " left the room."
-    }, socket);
+    });
 
     this.sendUsers();
+    await this.scheduleCleanup();
   }
 
-  webSocketError(socket) {
+  async webSocketError(socket, error) {
+    const attachment = socket.deserializeAttachment() || {};
+
     try {
-      socket.close();
+      socket.close(1011, "Connection error");
     } catch {}
+
+    this.broadcast({
+      type: "notice",
+      text: (attachment.username || "A member") + " disconnected."
+    });
+
     this.sendUsers();
+    await this.scheduleCleanup();
   }
 
-  broadcast(data, except = null) {
+  broadcast(data, exceptSocket) {
     const message = JSON.stringify(data);
 
     for (const socket of this.ctx.getWebSockets()) {
-      if (socket === except) continue;
+      if (socket === exceptSocket) continue;
 
-      try {
-        socket.send(message);
-      } catch {}
+      if (socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(message);
+        } catch {}
+      }
     }
   }
 
- sendUsers() {
-    const users = this.ctx.getWebSockets()
-        .filter(socket => socket.readyState === WebSocket.OPEN)
-        .map(socket => {
-            const attachment = socket.deserializeAttachment() || {};
-            return attachment.username || "Guest";
-        });
+  sendUsers() {
+    const users = [];
+
+    for (const socket of this.ctx.getWebSockets()) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+
+      const attachment = socket.deserializeAttachment() || {};
+      users.push(attachment.username || "Guest");
+    }
 
     this.broadcast({
-        type: "users",
-        users
+      type: "users",
+      users
     });
+  }
+
+  async scheduleCleanup() {
+    await this.ctx.storage.setAlarm(Date.now() + 30000);
+  }
+
+  async alarm() {
+    const now = Date.now();
+    let removed = false;
+
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() || {};
+      const lastSeen = attachment.lastSeen || 0;
+
+      if (now - lastSeen > 70000) {
+        try {
+          socket.close(1000, "Connection timed out");
+        } catch {}
+
+        removed = true;
+      }
+    }
+
+    if (removed) {
+      this.sendUsers();
+    }
+
+    if (this.ctx.getWebSockets().length > 0) {
+      await this.scheduleCleanup();
+    }
+  }
 }
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MR UNKNOWN'S CHAT PARADISE</title>
 <style>
-*{box-sizing:border-box}
-body{
- margin:0;font-family:Arial,sans-serif;color:white;min-height:100vh;
- background:linear-gradient(rgba(0,0,0,.70),rgba(0,0,0,.85)),
- url("https://i.ibb.co/SDCt8Vsq/3b80d00a-f405-45d7-96d8-1f391222bb8c.png")
- center/cover fixed;
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 20px;
+  background: #090000 url('https://i.ibb.co/SDCt8Vsq/3b80d00a-f405-45d7-96d8-1f391222bb.png') center center / cover fixed;
+  color: white;
+  font-family: Arial, sans-serif;
 }
-header{text-align:center;background:rgba(0,0,0,.9);padding:22px;border-bottom:2px solid #b00000}
-header h1{color:#ff2020;font-size:clamp(23px,5vw,38px);text-shadow:0 0 15px red;margin:0}
-header p{color:#ddd;letter-spacing:3px;font-size:12px}
-nav{background:#160000;display:flex;justify-content:center;flex-wrap:wrap;border-bottom:1px solid #700000}
-nav button{background:none;border:0;color:white;padding:15px 18px;cursor:pointer;font-weight:bold}
-nav button:hover{background:#750000}
-.container{max-width:1200px;margin:25px auto;padding:15px}
-.panel{background:rgba(0,0,0,.9);border:1px solid #8b0000;border-radius:9px;padding:20px;box-shadow:0 0 18px #6004}
-h2{color:#ff3030;margin-top:0}
-.login{max-width:430px;margin:35px auto;text-align:center}
-input,textarea{width:100%;padding:13px;margin:8px 0;background:#171717;border:1px solid #700000;border-radius:5px;color:white}
-.btn{background:#a00000;color:white;border:1px solid #ff3333;padding:12px 18px;border-radius:5px;cursor:pointer;font-weight:bold;margin:4px}
-.btn:hover{background:#e00000}
-.small{color:#aaa;font-size:12px}
-.hidden{display:none!important}
-.dashboard{display:grid;grid-template-columns:220px 1fr 190px;gap:15px;margin-top:20px}
-.room{background:#171010;border:1px solid #500000;padding:13px;margin:9px 0;border-radius:5px;cursor:pointer}
-.room:hover,.room.active{background:#610000;border-color:red}
-.chat-area{min-height:330px;max-height:430px;overflow-y:auto;background:#101010;padding:14px;border:1px solid #500000;border-radius:5px}
-.message{padding:9px;border-bottom:1px solid #292020;overflow-wrap:anywhere}
-.message strong{color:#ff4444}
-.users{color:#ddd;font-size:14px}
-.status{color:#00dd77}
-footer{text-align:center;padding:25px;color:#aaa;font-size:12px}
-.video-box{background:#111;border:1px solid #700000;min-height:130px;padding:15px;text-align:center;margin:10px 0}
-@media(max-width:750px){.dashboard{grid-template-columns:1fr}nav button{padding:12px 9px;font-size:12px}}
+
+header {
+  text-align: center;
+  padding: 25px 10px;
+  background: rgba(0,0,0,.88);
+  border: 2px solid #a00000;
+  box-shadow: 0 0 20px red;
+  margin-bottom: 20px;
+}
+
+h1 {
+  color: #ff2020;
+  text-shadow: 0 0 12px red;
+  font-size: clamp(24px, 5vw, 42px);
+}
+
+header p { color: #ddd; }
+
+nav {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+button {
+  background: #850000;
+  border: 1px solid red;
+  color: white;
+  padding: 11px 17px;
+  cursor: pointer;
+  border-radius: 5px;
+  font-weight: bold;
+}
+
+button:hover { background: #c00000; }
+
+.panel {
+  background: rgba(0,0,0,.92);
+  border: 1px solid #a00000;
+  padding: 18px;
+  border-radius: 8px;
+  margin-bottom: 18px;
+}
+
+input {
+  width: 100%;
+  padding: 12px;
+  background: #171717;
+  border: 1px solid #900000;
+  color: white;
+  margin: 8px 0;
+  border-radius: 4px;
+}
+
+.hidden { display: none !important; }
+
+#layout {
+  display: grid;
+  grid-template-columns: 190px minmax(0,1fr) 190px;
+  gap: 15px;
+}
+
+.room {
+  display: block;
+  width: 100%;
+  margin-bottom: 9px;
+  text-align: left;
+}
+
+.room.active { background: #c00000; }
+
+#messages {
+  height: 360px;
+  overflow-y: auto;
+  background: #080808;
+  border: 1px solid #500000;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.message {
+  padding: 8px;
+  border-bottom: 1px solid #292020;
+  overflow-wrap: anywhere;
+}
+
+.message strong { color: #ff4444; }
+.message small { color: #999; margin-left: 8px; }
+
+.notice {
+  color: #ffb0b0;
+  font-style: italic;
+  padding: 7px;
+}
+
+#onlineList { line-height: 2; }
+
+#connection { color: #ff7777; }
+
+#webcamVideo {
+  max-width: 100%;
+  background: black;
+}
+
+@media(max-width: 800px) {
+  #layout { grid-template-columns: 1fr; }
+  #messages { height: 300px; }
+}
 </style>
 </head>
 <body>
+
 <header>
 <h1>MR UNKNOWN'S CHAT PARADISE</h1>
 <p>WHERE STRANGERS BECOME FRIENDS</p>
 </header>
 
 <nav>
-<button onclick="showSection('home')">HOME</button>
-<button onclick="showSection('rooms')">CHATROOMS</button>
-<button onclick="showSection('media')">WEBCAMS</button>
-<button onclick="showSection('admin')">ADMIN</button>
+<button onclick="showPage('home')">HOME</button>
+<button onclick="showPage('chat')">CHATROOMS</button>
+<button onclick="showPage('webcam')">WEBCAMS</button>
+<button onclick="showPage('admin')">ADMIN</button>
 </nav>
 
-<main class="container">
-<section id="home" class="panel login">
+<section id="home" class="panel">
 <h2>WELCOME TO PARADISE</h2>
-<p>Enter your username to explore the chat community.</p>
-<input id="username" maxlength="24" placeholder="Choose your username">
-<button class="btn" onclick="enterChat()">ENTER CHAT PARADISE</button>
-<p class="small">Welcome to the MR UNKNOWN community!</p>
+<p>Enter your username to join the chat.</p>
+<input id="username" maxlength="24" placeholder="Enter your username">
+<button onclick="enterChat()">ENTER CHAT PARADISE</button>
 </section>
 
-<section id="rooms" class="hidden">
-<h2>THE CHATROOM LOUNGE</h2>
-<p>Choose a room to explore.</p>
-<div class="dashboard">
+<section id="chat" class="hidden">
+<div id="layout">
+
 <div class="panel">
-<h2>CHATROOMS</h2>
-<div id="roomList"></div>
+<h3>CHATROOMS</h3>
+<div id="rooms"></div>
 </div>
 
 <div class="panel">
 <h2 id="roomTitle">Welcome Lounge</h2>
-<div class="chat-area" id="messages"></div>
-<input id="chatInput" maxlength="500" placeholder="Type your message..." onkeydown="if(event.key==='Enter')sendMessage()">
-<button class="btn" onclick="sendMessage()">SEND MESSAGE</button>
-<p class="small" id="connection">Not connected</p>
+<p>Connection: <span id="connection">Disconnected</span></p>
+
+<div id="messages"></div>
+
+<input id="messageInput" maxlength="500" placeholder="Type your message..."
+onkeydown="if(event.key==='Enter') sendMessage()">
+
+<button onclick="sendMessage()">SEND MESSAGE</button>
 </div>
 
 <div class="panel">
-<h2>MEMBERS</h2>
-<div class="users" id="memberList"></div>
+<h3>ONLINE MEMBERS</h3>
+<p>Online: <span id="onlineCount">0</span></p>
+<div id="onlineList"></div>
 </div>
+
 </div>
 </section>
 
-<section id="media" class="hidden panel">
+<section id="webcam" class="panel hidden">
 <h2>WEBCAM & VOICE LOUNGE</h2>
-<p>Your local camera preview.</p>
-<div class="video-box">
-<video id="preview" autoplay muted playsinline style="width:100%;max-height:300px;display:none"></video>
-<p id="cameraMessage">Your camera preview will appear here.</p>
-</div>
-<button class="btn" onclick="startCamera()">START CAMERA</button>
-<button class="btn" onclick="stopCamera()">STOP CAMERA</button>
-<p class="small">Local camera preview only. Live broadcasting requires a separate video service.</p>
+<p>Local camera preview only. This does not broadcast video to other members.</p>
+<video id="webcamVideo" autoplay muted playsinline></video>
+<br><br>
+<button onclick="startCamera()">START CAMERA</button>
+<button onclick="stopCamera()">STOP CAMERA</button>
 </section>
 
-<section id="admin" class="hidden panel">
+<section id="admin" class="panel hidden">
 <h2>ADMIN CONTROL PANEL</h2>
-<p>Owner and moderator controls.</p>
-<div class="room">
-<strong>MEMBER MANAGEMENT</strong>
-<p>Member moderation controls will be added in a later stage.</p>
-</div>
-<div class="room">
-<strong>ROOM MANAGEMENT</strong>
-<p>Room management controls will be added in a later stage.</p>
-</div>
-<p class="small">Administrative permissions are not active yet. Secure owner authentication is required.</p>
+<p>Administration tools can be added here in a later update.</p>
 </section>
-</main>
-
-<footer>MR UNKNOWN'S CHAT PARADISE<br>© 2026 - ALL RIGHTS RESERVED</footer>
 
 <script>
-let currentUser="";
-let currentRoom="Welcome Lounge";
-let socket=null;
-let cameraStream=null;
+var username = "";
+var currentRoom = "Welcome Lounge";
+var ws = null;
+var cameraStream = null;
+var heartbeat = null;
 
-const roomNames=[
-"Welcome Lounge","General Chat","Music Lounge",
-"Horror Movie Zone","Country Corner",
-"Private Hangout","Members Lounge"
+var roomNames = [
+"Welcome Lounge",
+"General Chat",
+"Music Lounge",
+"Horror Movie Zone",
+"Country Corner",
+"Private Hangout",
+"Members Lounge"
 ];
 
-function showSection(id){
-["home","rooms","media","admin"].forEach(name=>{
-document.getElementById(name).classList.add("hidden");
-});
-document.getElementById(id).classList.remove("hidden");
+function showPage(page) {
+  ["home","chat","webcam","admin"].forEach(function(id) {
+    document.getElementById(id).classList.add("hidden");
+  });
+  document.getElementById(page).classList.remove("hidden");
 }
 
-function enterChat(){
-const name=document.getElementById("username").value.trim();
-if(!name){alert("Please choose a username!");return;}
-currentUser=name;
-buildRooms();
-showSection("rooms");
-selectRoom("Welcome Lounge");
+function enterChat() {
+  var name = document.getElementById("username").value.trim();
+  if (!name) {
+    alert("Please enter a username.");
+    return;
+  }
+
+  username = name.slice(0,24);
+  buildRooms();
+  showPage("chat");
+  selectRoom("Welcome Lounge");
 }
 
-function buildRooms(){
-const list=document.getElementById("roomList");
-list.replaceChildren();
+function buildRooms() {
+  var container = document.getElementById("rooms");
+  container.textContent = "";
 
-roomNames.forEach(room=>{
-const item=document.createElement("div");
-item.className="room";
-const label=document.createElement("strong");
-label.textContent=room;
-item.appendChild(label);
-item.appendChild(document.createElement("br"));
-const small=document.createElement("span");
-small.className="small";
-small.textContent="Chatroom";
-item.appendChild(small);
-item.onclick=()=>selectRoom(room);
-list.appendChild(item);
-});
+  roomNames.forEach(function(room) {
+    var button = document.createElement("button");
+    button.className = "room";
+    button.textContent = room;
+    button.onclick = function() { selectRoom(room); };
+    container.appendChild(button);
+  });
 }
 
-function addMessage(username,text,time){
-const line=document.createElement("div");
-line.className="message";
-const name=document.createElement("strong");
-name.textContent=username+": ";
-line.appendChild(name);
-line.appendChild(document.createTextNode(text));
-if(time){
-const stamp=document.createElement("span");
-stamp.className="small";
-stamp.textContent="  "+new Date(time).toLocaleTimeString();
-line.appendChild(stamp);
-}
-const messages=document.getElementById("messages");
-messages.appendChild(line);
-messages.scrollTop=messages.scrollHeight;
+function selectRoom(room) {
+  currentRoom = room;
+  document.getElementById("roomTitle").textContent = room;
+  document.getElementById("messages").textContent = "";
+
+  document.querySelectorAll(".room").forEach(function(button) {
+    button.classList.toggle("active", button.textContent === room);
+  });
+
+  connectRoom();
 }
 
-function selectRoom(room){
-currentRoom=room;
-document.getElementById("roomTitle").textContent=room;
-document.getElementById("messages").replaceChildren();
-document.querySelectorAll("#roomList .room").forEach((item,index)=>{
-item.classList.toggle("active",roomNames[index]===room);
-});
-if(socket){
-socket.close();
-socket=null;
-}
-connectRoom();
+function connectRoom() {
+  if (ws) {
+    clearInterval(heartbeat);
+    ws.onclose = null;
+    ws.close();
+  }
+
+  document.getElementById("connection").textContent = "Connecting...";
+  document.getElementById("onlineList").textContent = "";
+  document.getElementById("onlineCount").textContent = "0";
+
+  var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  var url = protocol + "//" + location.host + "/ws?room=" +
+    encodeURIComponent(currentRoom) + "&username=" +
+    encodeURIComponent(username);
+
+  ws = new WebSocket(url);
+
+  ws.onopen = function() {
+    document.getElementById("connection").textContent = "Connected";
+    heartbeat = setInterval(function() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type:"ping"}));
+      }
+    }, 20000);
+  };
+
+  ws.onmessage = function(event) {
+    var data;
+
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+
+    if (data.type === "history") {
+      document.getElementById("messages").textContent = "";
+      (data.messages || []).forEach(addMessage);
+    }
+
+    if (data.type === "message" || data.type === "notice") {
+      addMessage(data);
+    }
+
+    if (data.type === "users") {
+      updateUsers(data.users || []);
+    }
+  };
+
+  ws.onclose = function() {
+    clearInterval(heartbeat);
+    document.getElementById("connection").textContent = "Disconnected";
+  };
+
+  ws.onerror = function() {
+    document.getElementById("connection").textContent = "Connection error";
+  };
 }
 
-function connectRoom(){
-const protocol=location.protocol==="https:"?"wss:":"ws:";
-const url=protocol+"//"+location.host+"/ws?room="+encodeURIComponent(currentRoom)+"&username="+encodeURIComponent(currentUser);
-socket=new WebSocket(url);
+function addMessage(data) {
+  var container = document.getElementById("messages");
+  var item = document.createElement("div");
 
-socket.onopen=()=>{
-document.getElementById("connection").textContent="● Connected to "+currentRoom;
-};
+  if (data.type === "notice") {
+    item.className = "notice";
+    item.textContent = data.text || "";
+  } else {
+    item.className = "message";
 
-socket.onmessage=event=>{
-let data;
-try{data=JSON.parse(event.data);}catch{return;}
+    var name = document.createElement("strong");
+    name.textContent = data.username || "Guest";
 
-if(data.type==="history"){
-document.getElementById("messages").replaceChildren();
-data.messages.forEach(message=>{
-addMessage(message.username,message.text,message.time);
-});
-}
-if(data.type==="message"){
-addMessage(data.message.username,data.message.text,data.message.time);
-}
-if(data.type==="notice"){
-addMessage("SYSTEM",data.text);
-}
-if(data.type==="users"){
-const list=document.getElementById("memberList");
-list.replaceChildren();
-data.users.forEach(user=>{
-const line=document.createElement("p");
-line.className="status";
-line.textContent="● "+user;
-list.appendChild(line);
-});
-}
-};
+    var time = document.createElement("small");
+    time.textContent = data.time || "";
 
-socket.onclose=()=>{
-document.getElementById("connection").textContent="Disconnected";
-};
-socket.onerror=()=>{
-document.getElementById("connection").textContent="Connection error";
-};
+    var text = document.createElement("div");
+    text.textContent = data.text || "";
+
+    item.appendChild(name);
+    item.appendChild(time);
+    item.appendChild(text);
+  }
+
+  container.appendChild(item);
+  container.scrollTop = container.scrollHeight;
 }
 
-function sendMessage(){
-const input=document.getElementById("chatInput");
-const message=input.value.trim();
-if(!message||!socket||socket.readyState!==WebSocket.OPEN)return;
-socket.send(JSON.stringify({type:"message",text:message}));
-input.value="";
+function updateUsers(users) {
+  var list = document.getElementById("onlineList");
+  list.textContent = "";
+  document.getElementById("onlineCount").textContent = users.length;
+
+  users.forEach(function(name) {
+    var item = document.createElement("div");
+    item.textContent = "● " + name;
+    list.appendChild(item);
+  });
 }
 
-async function startCamera(){
-try{
-cameraStream=await navigator.mediaDevices.getUserMedia({video:true,audio:true});
-const video=document.getElementById("preview");
-video.srcObject=cameraStream;
-video.style.display="block";
-document.getElementById("cameraMessage").textContent="Your local camera and microphone are active.";
-}catch(error){
-alert("Camera permission was not granted or the device is unavailable.");
-}
+function sendMessage() {
+  var input = document.getElementById("messageInput");
+  var text = input.value.trim();
+
+  if (!text) return;
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    alert("You are not connected to the room.");
+    return;
+  }
+
+  ws.send(JSON.stringify({
+    type: "chat",
+    text: text.slice(0,500)
+  }));
+
+  input.value = "";
 }
 
-function stopCamera(){
-if(cameraStream){
-cameraStream.getTracks().forEach(track=>track.stop());
-cameraStream=null;
+async function startCamera() {
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true
+    });
+    document.getElementById("webcamVideo").srcObject = cameraStream;
+  } catch(error) {
+    alert("Camera access was not available. Check browser permissions.");
+  }
 }
-const video=document.getElementById("preview");
-video.srcObject=null;
-video.style.display="none";
-document.getElementById("cameraMessage").textContent="Camera is stopped.";
+
+function stopCamera() {
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(function(track) {
+      track.stop();
+    });
+    cameraStream = null;
+  }
+
+  document.getElementById("webcamVideo").srcObject = null;
 }
 </script>
+
 </body>
 </html>`;
