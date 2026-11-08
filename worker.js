@@ -6,6 +6,8 @@ export default {
       return Response.json({ status: "online", site: "MR UNKNOWN'S CHAT PARADISE" });
     }
 
+    if (url.pathname === "/_roles") return new Response("Not found", {status:404});
+
     if (url.pathname === "/ws") {
       if (!env.CHAT_ROOMS) {
         return new Response("Chat binding is not configured.", { status: 503 });
@@ -36,6 +38,13 @@ export default {
 function cleanText(value, max) {
   return String(value || "").replace(/[<>]/g, "").trim().slice(0, max);
 }
+function normalizeUser(value) { return cleanText(value, 24).toLowerCase(); }
+async function hashStaffPassword(password, salt) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({name:"PBKDF2",salt:enc.encode(salt),iterations:120000,hash:"SHA-256"},key,256);
+  return Array.from(new Uint8Array(bits), b => b.toString(16).padStart(2,"0")).join("");
+}
 
 export class ChatRoom {
   constructor(ctx, env) {
@@ -44,6 +53,31 @@ export class ChatRoom {
   }
 
   async fetch(request) {
+    const internalUrl = new URL(request.url);
+    if (internalUrl.pathname === "/_roles") {
+      if (!this.env.OWNER_SECRET || request.headers.get("X-Owner-Secret") !== this.env.OWNER_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const username = normalizeUser(internalUrl.searchParams.get("username"));
+      const roles = (await this.ctx.storage.get("staffRoles")) || {};
+      if (request.method === "GET") return Response.json(roles[username] || null);
+      if (request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const name = normalizeUser(body.username);
+        if (!name || !["admin","moderator"].includes(body.role) || !body.salt || !body.passwordHash) {
+          return new Response("Invalid role record", {status:400});
+        }
+        roles[name] = {role:body.role,salt:body.salt,passwordHash:body.passwordHash};
+        await this.ctx.storage.put("staffRoles",roles);
+        return Response.json({ok:true});
+      }
+      if (request.method === "DELETE") {
+        delete roles[username];
+        await this.ctx.storage.put("staffRoles",roles);
+        return Response.json({ok:true});
+      }
+      return new Response("Method not allowed",{status:405});
+    }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -67,111 +101,131 @@ export class ChatRoom {
 
   async webSocketMessage(socket, raw) {
     let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return;
-    }
-
+    try { data = JSON.parse(raw); } catch { return; }
     const attachment = socket.deserializeAttachment() || {};
     const username = attachment.username || "Guest";
 
-    if (data.type === "message") {
-      if (attachment.muted) {
-        socket.send(JSON.stringify({ type: "notice", text: "You are muted by the room owner." }));
+    if (data.type === "authRole") {
+      const record = await this.getGlobalRole(username);
+      if (!record || !data.password || await hashStaffPassword(String(data.password), record.salt) !== record.passwordHash) {
+        socket.send(JSON.stringify({type:"roleAuthResult",ok:false,text:"Staff login failed. Check the username and staff password."}));
         return;
       }
-      const text = cleanText(data.text, 500);
-      if (!text) return;
-
-      const entry = {
-        id: crypto.randomUUID(),
-        username,
-        text,
-        time: new Date().toISOString()
-      };
-      const history = (await this.ctx.storage.get("history")) || [];
-      history.push(entry);
-      while (history.length > 100) history.shift();
-      await this.ctx.storage.put("history", history);
-      this.broadcast({ type: "message", message: entry });
+      attachment.role = record.role;
+      socket.serializeAttachment(attachment);
+      socket.send(JSON.stringify({type:"roleAuthResult",ok:true,role:record.role,text:"Staff login successful."}));
+      this.sendUsers();
       return;
     }
 
-    if (data.type === "signal") {
-      const target = String(data.target || "");
-      const recipient = this.ctx.getWebSockets().find(ws => {
-        const a = ws.deserializeAttachment() || {};
-        return a.peerId === target;
-      });
-      if (recipient) {
-        recipient.send(JSON.stringify({
-          type: "signal",
-          from: attachment.peerId,
-          signal: data.signal
-        }));
+    if (data.type === "message") {
+      if (attachment.muted) {
+        socket.send(JSON.stringify({type:"notice",text:"You are muted by room staff."}));
+        return;
       }
+      const text = cleanText(data.text,500);
+      if (!text) return;
+      const entry={id:crypto.randomUUID(),username,text,time:new Date().toISOString()};
+      const history=(await this.ctx.storage.get("history"))||[];
+      history.push(entry); while(history.length>100)history.shift();
+      await this.ctx.storage.put("history",history);
+      this.broadcast({type:"message",message:entry}); return;
+    }
+
+    if (data.type === "signal") {
+      const recipient=this.ctx.getWebSockets().find(ws=>(ws.deserializeAttachment()||{}).peerId===String(data.target||""));
+      if(recipient)recipient.send(JSON.stringify({type:"signal",from:attachment.peerId,signal:data.signal}));
       return;
     }
 
     if (data.type === "admin") {
-      const secret = String(data.secret || "");
-      if (!this.env.OWNER_SECRET || secret !== this.env.OWNER_SECRET) {
-        socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "Owner login failed." }));
+      const action=String(data.action||"");
+      const isOwner=!!this.env.OWNER_SECRET && String(data.secret||"")===this.env.OWNER_SECRET;
+      const role=attachment.role||"member";
+      const isStaff=role==="admin"||role==="moderator";
+
+      if(action==="login"){
+        socket.send(JSON.stringify({type:"adminResult",ok:isOwner,text:isOwner?"Owner login successful.":"Owner login failed."})); return;
+      }
+      if(!isOwner&&!isStaff){
+        socket.send(JSON.stringify({type:"adminResult",ok:false,text:"You do not have permission to use that control."})); return;
+      }
+      if(action==="clear"){
+        if(!isOwner){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Only the owner can clear chat history."}));return;}
+        await this.ctx.storage.put("history",[]);
+        this.broadcast({type:"clear"});
+        socket.send(JSON.stringify({type:"adminResult",ok:true,text:"This room's chat history was cleared."}));return;
+      }
+      if(action==="assignRole"||action==="removeRole"){
+        if(!isOwner){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Only the owner can manage staff roles."}));return;}
+        const targetName=normalizeUser(data.username);
+        if(!targetName){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Enter a username."}));return;}
+        if(action==="removeRole"){
+          const removed=await this.deleteGlobalRole(targetName);
+          socket.send(JSON.stringify({type:"adminResult",ok:removed,text:removed?"Staff role removed for "+targetName+" across all rooms.":"Could not remove that staff role."}));
+          return;
+        }
+        const newRole=String(data.role||"");
+        const staffPassword=String(data.staffPassword||"");
+        if(!["admin","moderator"].includes(newRole)||staffPassword.length<8){
+          socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Choose Admin or Moderator and enter a staff password of at least 8 characters."}));return;
+        }
+        const salt=crypto.randomUUID()+crypto.randomUUID();
+        const saved=await this.saveGlobalRole(targetName,{role:newRole,salt,passwordHash:await hashStaffPassword(staffPassword,salt)});
+        socket.send(JSON.stringify({type:"adminResult",ok:saved,text:saved?targetName+" appointed "+newRole+" across all rooms. Give them the staff password privately.":"Could not save the staff role."}));
         return;
       }
 
-      const action = String(data.action || "");
-      if (action === "login") {
-        socket.send(JSON.stringify({ type: "adminResult", ok: true, text: "Owner login successful." }));
-        return;
+      const targetSocket=this.ctx.getWebSockets().find(ws=>(ws.deserializeAttachment()||{}).peerId===String(data.target||""));
+      if(!targetSocket){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"That member is no longer connected."}));return;}
+      const targetAttachment=targetSocket.deserializeAttachment()||{};
+      if(!isOwner&&["owner","admin","moderator"].includes(targetAttachment.role)){
+        socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Staff cannot moderate another staff member."}));return;
       }
-
-      if (action === "clear") {
-        await this.ctx.storage.put("history", []);
-        this.broadcast({ type: "clear" });
-        socket.send(JSON.stringify({ type: "adminResult", ok: true, text: "This room's chat history was cleared." }));
-        return;
+      if(action==="kick"){
+        try{targetSocket.send(JSON.stringify({type:"kicked",text:"You were removed from this room by room staff."}));targetSocket.close(4001,"Removed by room staff");}catch{}
+        this.broadcast({type:"notice",text:(targetAttachment.username||"A member")+" was removed by room staff."});
+        this.sendUsers();socket.send(JSON.stringify({type:"adminResult",ok:true,text:"Member removed."}));return;
       }
-
-      const targetId = String(data.target || "");
-      const targetSocket = this.ctx.getWebSockets().find(ws => {
-        const a = ws.deserializeAttachment() || {};
-        return a.peerId === targetId;
-      });
-
-      if (!targetSocket) {
-        socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "That member is no longer connected." }));
-        return;
-      }
-
-      const targetAttachment = targetSocket.deserializeAttachment() || {};
-      if (action === "kick") {
-        try {
-          targetSocket.send(JSON.stringify({ type: "kicked", text: "The room owner removed you from this room." }));
-          targetSocket.close(4001, "Removed by room owner");
-        } catch {}
-        this.broadcast({ type: "notice", text: (targetAttachment.username || "A member") + " was removed by the room owner." });
-        this.sendUsers();
-        socket.send(JSON.stringify({ type: "adminResult", ok: true, text: "Member removed." }));
-        return;
-      }
-
-      if (action === "mute" || action === "unmute") {
-        targetAttachment.muted = action === "mute";
-        targetSocket.serializeAttachment(targetAttachment);
-        targetSocket.send(JSON.stringify({
-          type: "notice",
-          text: action === "mute" ? "The room owner muted you." : "The room owner unmuted you."
-        }));
-        this.sendUsers();
-        socket.send(JSON.stringify({
-          type: "adminResult",
-          ok: true,
-          text: action === "mute" ? "Member muted." : "Member unmuted."
-        }));
+      if(action==="mute"||action==="unmute"){
+        targetAttachment.muted=action==="mute";targetSocket.serializeAttachment(targetAttachment);
+        targetSocket.send(JSON.stringify({type:"notice",text:action==="mute"?"You are muted by room staff.":"You were unmuted by room staff."}));
+        this.sendUsers();socket.send(JSON.stringify({type:"adminResult",ok:true,text:action==="mute"?"Member muted.":"Member unmuted."}));
       }
     }
+  }
+
+  async getGlobalRole(username) {
+    try {
+      const id=this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
+      const response=await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles?username="+encodeURIComponent(normalizeUser(username)),{
+        headers:{"X-Owner-Secret":this.env.OWNER_SECRET||""}
+      });
+      return response.ok?await response.json():null;
+    } catch { return null; }
+  }
+
+  async saveGlobalRole(username,record) {
+    try {
+      const id=this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
+      const response=await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-Owner-Secret":this.env.OWNER_SECRET||""},
+        body:JSON.stringify({username,...record})
+      });
+      return response.ok;
+    } catch { return false; }
+  }
+
+  async deleteGlobalRole(username) {
+    try {
+      const id=this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
+      const response=await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles?username="+encodeURIComponent(normalizeUser(username)),{
+        method:"DELETE",
+        headers:{"X-Owner-Secret":this.env.OWNER_SECRET||""}
+      });
+      return response.ok;
+    } catch { return false; }
   }
 
   webSocketClose(socket) {
@@ -206,7 +260,8 @@ export class ChatRoom {
         return {
           id: a.peerId,
           username: a.username || "Guest",
-          muted: !!a.muted
+          muted: !!a.muted,
+          role: a.role || "member"
         };
       });
     this.broadcast({ type: "users", users });
@@ -267,6 +322,7 @@ footer{text-align:center;padding:25px;color:#aaa;font-size:12px}
 <h2>WELCOME TO PARADISE</h2>
 <p>Enter your username to explore the chat community.</p>
 <input id="username" maxlength="24" placeholder="Choose your username">
+<input id="staffPassword" type="password" placeholder="Staff password (staff only)">
 <button class="btn" onclick="enterChat()">ENTER CHAT PARADISE</button>
 <p class="small">Welcome to the MR UNKNOWN community!</p>
 </section>
@@ -299,16 +355,28 @@ footer{text-align:center;padding:25px;color:#aaa;font-size:12px}
 
 <section id="admin" class="panel hidden">
 <h2>ADMIN CONTROL PANEL</h2>
-<p>Owner-only room controls.</p>
 <div id="adminLogin">
-<input id="ownerSecret" type="password" autocomplete="current-password" placeholder="Owner password">
+<input id="ownerSecret" type="password" placeholder="Owner password">
 <button class="btn" onclick="adminLogin()">OWNER LOGIN</button>
-<p class="small">The owner password is checked by the server and is not displayed on the page.</p>
+<input id="staffLoginPassword" type="password" placeholder="Admin / moderator password">
+<button class="btn" onclick="staffLogin()">STAFF LOGIN</button>
+<p class="small">Staff must use their appointed username and the staff password given privately by the owner.</p>
 </div>
 <div id="adminControls" class="hidden">
-<p id="adminStatus" class="small">Owner controls are ready for this room.</p>
+<p id="adminStatus" class="small">Controls are ready.</p>
 <div id="adminMembers"></div>
+<div id="ownerRoleTools" class="hidden">
+<h2>APPOINT SITE STAFF</h2>
+<input id="roleUsername" maxlength="24" placeholder="Exact member username">
+<select id="roleChoice" style="width:100%;padding:12px;background:#171717;color:white;border:1px solid #700;border-radius:5px">
+<option value="admin">Administrator</option><option value="moderator">Moderator</option>
+</select>
+<input id="rolePassword" type="password" placeholder="Create staff password (8+ characters)">
+<button class="btn" onclick="assignRole()">APPOINT STAFF</button>
+<button class="btn" onclick="removeRole()">REMOVE STAFF ROLE</button>
+<p class="small">Staff roles work across all chatrooms. Give the staff password to the person privately.</p>
 <button class="btn" onclick="adminAction('clear')">CLEAR THIS ROOM'S MESSAGES</button>
+</div>
 <button class="btn" onclick="adminLogout()">LOG OUT</button>
 </div>
 </section>
@@ -317,7 +385,7 @@ footer{text-align:center;padding:25px;color:#aaa;font-size:12px}
 
 <script>
 let currentUser="",currentRoom="Welcome Lounge",socket=null,peerId=null;
-let localStream=null,ownerSecret="",members=[],peerConnections=new Map();
+let localStream=null,ownerSecret="",currentRole="member",members=[],peerConnections=new Map();
 const roomNames=["Welcome Lounge","General Chat","Music Lounge","Horror Movie Zone","Country Corner","Private Hangout","Members Lounge"];
 const rtcConfig={iceServers:[{urls:"stun:stun.l.google.com:19302"}]};
 
@@ -360,7 +428,11 @@ function connectRoom(){
 const protocol=location.protocol==="https:"?"wss:":"ws:";
 const url=protocol+"//"+location.host+"/ws?room="+encodeURIComponent(currentRoom)+"&username="+encodeURIComponent(currentUser);
 socket=new WebSocket(url);
-socket.onopen=()=>document.getElementById("connection").textContent="● Connected to "+currentRoom;
+socket.onopen=()=>{
+document.getElementById("connection").textContent="● Connected to "+currentRoom;
+const pw=document.getElementById("staffPassword").value;
+if(pw)socket.send(JSON.stringify({type:"authRole",password:pw}));
+};
 socket.onmessage=event=>{
 let data;try{data=JSON.parse(event.data);}catch{return;}
 if(data.type==="welcome"){
@@ -373,10 +445,29 @@ if(data.type==="clear")document.getElementById("messages").replaceChildren();
 if(data.type==="users"){members=data.users||[];renderMembers();updatePeerConnections();}
 if(data.type==="signal")handleSignal(data.from,data.signal);
 if(data.type==="kicked"){alert(data.text);stopMedia();closePeers();showSection("home");}
+if(data.type==="roleAuthResult"){
+document.getElementById("adminStatus").textContent=data.text;
+if(data.ok){
+currentRole=data.role;
+document.getElementById("adminLogin").classList.add("hidden");
+document.getElementById("adminControls").classList.remove("hidden");
+document.getElementById("ownerRoleTools").classList.add("hidden");
+renderAdminMembers();
+}
+}
 if(data.type==="adminResult"){
 document.getElementById("adminStatus").textContent=data.text;
-if(data.ok){document.getElementById("adminLogin").classList.add("hidden");document.getElementById("adminControls").classList.remove("hidden");renderAdminMembers();}
-else{document.getElementById("adminLogin").classList.remove("hidden");document.getElementById("adminControls").classList.add("hidden");ownerSecret="";document.getElementById("ownerSecret").value="";}
+if(data.ok && ownerSecret){
+currentRole="owner";
+document.getElementById("adminLogin").classList.add("hidden");
+document.getElementById("adminControls").classList.remove("hidden");
+document.getElementById("ownerRoleTools").classList.remove("hidden");
+renderAdminMembers();
+}else if(!data.ok && ownerSecret){
+document.getElementById("adminLogin").classList.remove("hidden");
+document.getElementById("adminControls").classList.add("hidden");
+ownerSecret="";document.getElementById("ownerSecret").value="";
+}
 }
 };
 socket.onclose=()=>{document.getElementById("connection").textContent="Disconnected";};
@@ -391,7 +482,7 @@ function renderMembers(){
 const list=document.getElementById("memberList");list.replaceChildren();
 members.forEach(member=>{
 const line=document.createElement("p");line.className="status";
-line.textContent="● "+member.username+(member.muted?" (muted)":"");
+line.textContent="● "+member.username+(member.role!=="member"?" ["+member.role+"]":"")+(member.muted?" (muted)":"");
 list.appendChild(line);
 });
 renderAdminMembers();
@@ -473,26 +564,48 @@ closePeers();if(peerId)updatePeerConnections();
 function adminLogin(){
 ownerSecret=document.getElementById("ownerSecret").value;
 if(!ownerSecret){alert("Enter the owner password.");return;}
-if(!socket||socket.readyState!==WebSocket.OPEN){document.getElementById("adminStatus").textContent="Connect to a chatroom before logging in.";return;}
+if(!socket||socket.readyState!==WebSocket.OPEN){alert("Join a chatroom first.");return;}
+socket.send(JSON.stringify({type:"admin",action:"login",secret:ownerSecret}));
 document.getElementById("adminStatus").textContent="Checking owner password...";
-socket.send(JSON.stringify({type:"admin",secret:ownerSecret,action:"login"}));
+}
+function staffLogin(){
+const pw=document.getElementById("staffLoginPassword").value;
+if(!pw||!socket||socket.readyState!==WebSocket.OPEN){alert("Enter your staff password and join a room first.");return;}
+socket.send(JSON.stringify({type:"authRole",password:pw}));
+document.getElementById("adminStatus").textContent="Checking staff login...";
 }
 function adminLogout(){
-ownerSecret="";document.getElementById("ownerSecret").value="";
+ownerSecret="";currentRole="member";
+document.getElementById("ownerSecret").value="";
+document.getElementById("staffLoginPassword").value="";
 document.getElementById("adminControls").classList.add("hidden");
 document.getElementById("adminLogin").classList.remove("hidden");
+document.getElementById("ownerRoleTools").classList.add("hidden");
 }
-function adminSend(action,target){
+function adminSend(action,target,extra={}){
 if(!socket||socket.readyState!==WebSocket.OPEN){alert("Connect to a chatroom first.");return;}
-socket.send(JSON.stringify({type:"admin",secret:ownerSecret,action,target}));
+socket.send(JSON.stringify({type:"admin",secret:ownerSecret,action,target,...extra}));
 }
 function adminAction(action){if(action==="clear"&&!confirm("Clear all saved messages in this room?"))return;adminSend(action);}
+function assignRole(){
+const username=document.getElementById("roleUsername").value.trim();
+const role=document.getElementById("roleChoice").value;
+const staffPassword=document.getElementById("rolePassword").value;
+if(!username||staffPassword.length<8){alert("Enter the exact username and a staff password of at least 8 characters.");return;}
+adminSend("assignRole","",{username,role,staffPassword});
+document.getElementById("rolePassword").value="";
+}
+function removeRole(){
+const username=document.getElementById("roleUsername").value.trim();
+if(!username){alert("Enter the exact username.");return;}
+if(confirm("Remove the staff role for "+username+" across all rooms?"))adminSend("removeRole","",{username});
+}
 function renderAdminMembers(){
 const box=document.getElementById("adminMembers");if(!box)return;box.replaceChildren();
-if(!ownerSecret)return;
+if(currentRole==="member")return;
 members.filter(m=>m.id!==peerId).forEach(member=>{
 const row=document.createElement("div");row.className="room";
-const name=document.createElement("strong");name.textContent=member.username;row.appendChild(name);
+const name=document.createElement("strong");name.textContent=member.username+" — "+(member.role||"member")+(member.muted?" (muted)":"");row.appendChild(name);
 const kick=document.createElement("button");kick.className="btn";kick.textContent="KICK";kick.onclick=()=>{if(confirm("Remove "+member.username+" from this room?"))adminSend("kick",member.id);};
 const mute=document.createElement("button");mute.className="btn";mute.textContent=member.muted?"UNMUTE":"MUTE";mute.onclick=()=>adminSend(member.muted?"unmute":"mute",member.id);
 row.append(kick,mute);box.appendChild(row);
