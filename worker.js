@@ -538,23 +538,60 @@ sendSignal(from,{description:pc.localDescription});
 }catch(e){console.error("WebRTC signaling error",e);}
 }
 async function startMedia(){
-if(!currentUser||!socket||socket.readyState!==WebSocket.OPEN){alert("Enter a chatroom first.");return;}
-try{
-localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:true});
-const grid=document.getElementById("localVideoGrid");grid.replaceChildren();
-const tile=document.createElement("div");tile.className="video-tile";
-const video=document.createElement("video");video.autoplay=true;video.muted=true;video.playsInline=true;video.srcObject=localStream;
-const label=document.createElement("p");label.textContent=currentUser+" (you)";
-tile.append(video,label);grid.appendChild(tile);
-document.getElementById("mediaStatus").textContent="Your webcam and microphone are on in "+currentRoom+".";
-for(const [id,pc] of peerConnections){
-for(const track of localStream.getTracks()){
-try{pc.addTrack(track,localStream);}catch{}
-}
-try{const offer=await pc.createOffer();await pc.setLocalDescription(offer);sendSignal(id,{description:pc.localDescription});}catch(err){console.error("Could not start media connection",err);}
-}
-}catch(e){document.getElementById("mediaStatus").textContent="Could not start camera/microphone. Check browser permissions and device settings.";alert("Camera or microphone permission was not granted, or a device is unavailable.");}
-}
+  if(!currentUser||!socket||socket.readyState!==WebSocket.OPEN){
+    alert("Enter a chatroom first.");
+    return;
+  }
+
+  try{
+    localStream=await navigator.mediaDevices.getUserMedia({
+      audio:true,
+      video:true
+    });
+
+    const tile=document.createElement("div");
+    tile.className="video-tile";
+    tile.style.border="3px solid #22c55e";
+    tile.id="local-video";
+
+    const video=document.createElement("video");
+    video.autoplay=true;
+    video.muted=true;
+    video.playsInline=true;
+    video.srcObject=localStream;
+
+    const label=document.createElement("p");
+    label.textContent=currentUser+" (YOU) ● LIVE";
+    label.style.color="#22c55e";
+
+    const meter=document.createElement("p");
+    meter.textContent="Microphone active";
+    meter.id="localMicMeter";
+
+    tile.append(video,label,meter);
+    document.getElementById("videoGrid").appendChild(tile);
+
+    document.getElementById("mediaStatus").textContent=
+      "Your webcam and microphone are on in "+currentRoom+".";
+
+    for(const [id,pc] of peerConnections){
+      for(const track of localStream.getTracks()){
+        try{pc.addTrack(track,localStream);}catch{}
+      }
+      try{
+        const offer=await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sendSignal(id,{description:pc.localDescription});
+      }catch(err){
+        console.error(err);
+      }
+    }
+
+  }catch(e){
+    document.getElementById("mediaStatus").textContent=
+      "Could not start camera/microphone. Check permissions.";
+    alert("Camera or microphone permission was not granted.");
+  }
 function stopMedia(){
 if(localStream){localStream.getTracks().forEach(track=>track.stop());localStream=null;}
 document.getElementById("localVideoGrid").replaceChildren();
