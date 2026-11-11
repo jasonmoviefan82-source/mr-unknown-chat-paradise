@@ -418,7 +418,25 @@ const box=document.getElementById("messages");box.appendChild(line);box.scrollTo
 function selectRoom(room){
 currentRoom=room;document.getElementById("roomTitle").textContent=room;
 document.getElementById("messages").replaceChildren();document.getElementById("memberList").replaceChildren();
-document.getElementById("videoGrid").replaceChildren();
+document.getElementById("videoGrid").replaceChildren();if(localStream){
+  const tile=document.createElement("div");
+  tile.className="video-tile";
+  tile.id="local-video";
+  tile.style.border="3px solid #22c55e";
+
+  const video=document.createElement("video");
+  video.autoplay=true;
+  video.muted=true;
+  video.playsInline=true;
+  video.srcObject=localStream;
+
+  const label=document.createElement("p");
+  label.textContent=currentUser+" (YOU) ● LIVE";
+  label.style.color="#22c55e";
+
+  tile.append(video,label);
+  document.getElementById("videoGrid").appendChild(tile);
+}
 document.querySelectorAll("#roomList .room").forEach((item,index)=>item.classList.toggle("active",roomNames[index]===room));
 closePeers();
 if(socket){socket.onclose=null;socket.close();socket=null;}
