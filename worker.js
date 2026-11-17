@@ -1,13 +1,14 @@
-export default {
+var __defProp = Object.defineProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
+
+// worker.js
+var worker_default = {
   async fetch(request, env) {
     const url = new URL(request.url);
-
     if (url.pathname === "/health") {
       return Response.json({ status: "online", site: "MR UNKNOWN'S CHAT PARADISE" });
     }
-
-    if (url.pathname === "/_roles") return new Response("Not found", {status:404});
-
+    if (url.pathname === "/_roles") return new Response("Not found", { status: 404 });
     if (url.pathname === "/ws") {
       if (!env.CHAT_ROOMS) {
         return new Response("Chat binding is not configured.", { status: 503 });
@@ -15,7 +16,6 @@ export default {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("WebSocket upgrade required.", { status: 426 });
       }
-
       const room = cleanText(url.searchParams.get("room") || "Welcome Lounge", 50);
       const username = cleanText(url.searchParams.get("username") || "Guest", 24) || "Guest";
       const id = env.CHAT_ROOMS.idFromName(room);
@@ -24,7 +24,6 @@ export default {
       headers.set("X-Chat-Room", room);
       return env.CHAT_ROOMS.get(id).fetch(new Request(request, { headers }));
     }
-
     return new Response(HTML, {
       headers: {
         "Content-Type": "text/html;charset=UTF-8",
@@ -34,200 +33,227 @@ export default {
     });
   }
 };
-
 function cleanText(value, max) {
   return String(value || "").replace(/[<>]/g, "").trim().slice(0, max);
 }
-function normalizeUser(value) { return cleanText(value, 24).toLowerCase(); }
+__name(cleanText, "cleanText");
+function normalizeUser(value) {
+  return cleanText(value, 24).toLowerCase();
+}
+__name(normalizeUser, "normalizeUser");
 async function hashStaffPassword(password, salt) {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({name:"PBKDF2",salt:enc.encode(salt),iterations:120000,hash:"SHA-256"},key,256);
-  return Array.from(new Uint8Array(bits), b => b.toString(16).padStart(2,"0")).join("");
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: enc.encode(salt), iterations: 12e4, hash: "SHA-256" }, key, 256);
+  return Array.from(new Uint8Array(bits), (b) => b.toString(16).padStart(2, "0")).join("");
 }
-
-export class ChatRoom {
+__name(hashStaffPassword, "hashStaffPassword");
+var ChatRoom = class {
+  static {
+    __name(this, "ChatRoom");
+  }
   constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
   }
-
   async fetch(request) {
     const internalUrl = new URL(request.url);
     if (internalUrl.pathname === "/_roles") {
       if (!this.env.OWNER_SECRET || request.headers.get("X-Owner-Secret") !== this.env.OWNER_SECRET) {
         return new Response("Unauthorized", { status: 401 });
       }
-      const username = normalizeUser(internalUrl.searchParams.get("username"));
-      const roles = (await this.ctx.storage.get("staffRoles")) || {};
-      if (request.method === "GET") return Response.json(roles[username] || null);
+      const username2 = normalizeUser(internalUrl.searchParams.get("username"));
+      const roles = await this.ctx.storage.get("staffRoles") || {};
+      if (request.method === "GET") return Response.json(roles[username2] || null);
       if (request.method === "POST") {
         const body = await request.json().catch(() => ({}));
         const name = normalizeUser(body.username);
-        if (!name || !["admin","moderator"].includes(body.role) || !body.salt || !body.passwordHash) {
-          return new Response("Invalid role record", {status:400});
+        if (!name || !["admin", "moderator"].includes(body.role) || !body.salt || !body.passwordHash) {
+          return new Response("Invalid role record", { status: 400 });
         }
-        roles[name] = {role:body.role,salt:body.salt,passwordHash:body.passwordHash};
-        await this.ctx.storage.put("staffRoles",roles);
-        return Response.json({ok:true});
+        roles[name] = { role: body.role, salt: body.salt, passwordHash: body.passwordHash };
+        await this.ctx.storage.put("staffRoles", roles);
+        return Response.json({ ok: true });
       }
       if (request.method === "DELETE") {
-        delete roles[username];
-        await this.ctx.storage.put("staffRoles",roles);
-        return Response.json({ok:true});
+        delete roles[username2];
+        await this.ctx.storage.put("staffRoles", roles);
+        return Response.json({ ok: true });
       }
-      return new Response("Method not allowed",{status:405});
+      return new Response("Method not allowed", { status: 405 });
     }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     const username = request.headers.get("X-Chat-Username") || "Guest";
     const peerId = crypto.randomUUID();
-
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ username, peerId, muted: false });
-
-    const history = (await this.ctx.storage.get("history")) || [];
+    const history = await this.ctx.storage.get("history") || [];
     server.send(JSON.stringify({ type: "welcome", peerId, messages: history }));
-
     this.broadcast({
       type: "notice",
       text: username + " joined the room."
     }, server);
-
     this.sendUsers();
     return new Response(null, { status: 101, webSocket: client });
   }
-
   async webSocketMessage(socket, raw) {
     let data;
-    try { data = JSON.parse(raw); } catch { return; }
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return;
+    }
     const attachment = socket.deserializeAttachment() || {};
     const username = attachment.username || "Guest";
-
     if (data.type === "authRole") {
       const record = await this.getGlobalRole(username);
       if (!record || !data.password || await hashStaffPassword(String(data.password), record.salt) !== record.passwordHash) {
-        socket.send(JSON.stringify({type:"roleAuthResult",ok:false,text:"Staff login failed. Check the username and staff password."}));
+        socket.send(JSON.stringify({ type: "roleAuthResult", ok: false, text: "Staff login failed. Check the username and staff password." }));
         return;
       }
       attachment.role = record.role;
       socket.serializeAttachment(attachment);
-      socket.send(JSON.stringify({type:"roleAuthResult",ok:true,role:record.role,text:"Staff login successful."}));
+      socket.send(JSON.stringify({ type: "roleAuthResult", ok: true, role: record.role, text: "Staff login successful." }));
       this.sendUsers();
       return;
     }
-
     if (data.type === "message") {
       if (attachment.muted) {
-        socket.send(JSON.stringify({type:"notice",text:"You are muted by room staff."}));
+        socket.send(JSON.stringify({ type: "notice", text: "You are muted by room staff." }));
         return;
       }
-      const text = cleanText(data.text,500);
+      const text = cleanText(data.text, 500);
       if (!text) return;
-      const entry={id:crypto.randomUUID(),username,text,time:new Date().toISOString()};
-      const history=(await this.ctx.storage.get("history"))||[];
-      history.push(entry); while(history.length>100)history.shift();
-      await this.ctx.storage.put("history",history);
-      this.broadcast({type:"message",message:entry}); return;
-    }
-
-    if (data.type === "signal") {
-      const recipient=this.ctx.getWebSockets().find(ws=>(ws.deserializeAttachment()||{}).peerId===String(data.target||""));
-      if(recipient)recipient.send(JSON.stringify({type:"signal",from:attachment.peerId,signal:data.signal}));
+      const entry = { id: crypto.randomUUID(), username, text, time: (/* @__PURE__ */ new Date()).toISOString() };
+      const history = await this.ctx.storage.get("history") || [];
+      history.push(entry);
+      while (history.length > 100) history.shift();
+      await this.ctx.storage.put("history", history);
+      this.broadcast({ type: "message", message: entry });
       return;
     }
-
+    if (data.type === "signal") {
+      const recipient = this.ctx.getWebSockets().find((ws) => (ws.deserializeAttachment() || {}).peerId === String(data.target || ""));
+      if (recipient) recipient.send(JSON.stringify({ type: "signal", from: attachment.peerId, signal: data.signal }));
+      return;
+    }
     if (data.type === "admin") {
-      const action=String(data.action||"");
-      const isOwner=!!this.env.OWNER_SECRET && String(data.secret||"")===this.env.OWNER_SECRET;
-      const role=attachment.role||"member";
-      const isStaff=role==="admin"||role==="moderator";
-
-      if(action==="login"){
-        socket.send(JSON.stringify({type:"adminResult",ok:isOwner,text:isOwner?"Owner login successful.":"Owner login failed."})); return;
-      }
-      if(!isOwner&&!isStaff){
-        socket.send(JSON.stringify({type:"adminResult",ok:false,text:"You do not have permission to use that control."})); return;
-      }
-      if(action==="clear"){
-        if(!isOwner){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Only the owner can clear chat history."}));return;}
-        await this.ctx.storage.put("history",[]);
-        this.broadcast({type:"clear"});
-        socket.send(JSON.stringify({type:"adminResult",ok:true,text:"This room's chat history was cleared."}));return;
-      }
-      if(action==="assignRole"||action==="removeRole"){
-        if(!isOwner){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Only the owner can manage staff roles."}));return;}
-        const targetName=normalizeUser(data.username);
-        if(!targetName){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Enter a username."}));return;}
-        if(action==="removeRole"){
-          const removed=await this.deleteGlobalRole(targetName);
-          socket.send(JSON.stringify({type:"adminResult",ok:removed,text:removed?"Staff role removed for "+targetName+" across all rooms.":"Could not remove that staff role."}));
-          return;
-        }
-        const newRole=String(data.role||"");
-        const staffPassword=String(data.staffPassword||"");
-        if(!["admin","moderator"].includes(newRole)||staffPassword.length<8){
-          socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Choose Admin or Moderator and enter a staff password of at least 8 characters."}));return;
-        }
-        const salt=crypto.randomUUID()+crypto.randomUUID();
-        const saved=await this.saveGlobalRole(targetName,{role:newRole,salt,passwordHash:await hashStaffPassword(staffPassword,salt)});
-        socket.send(JSON.stringify({type:"adminResult",ok:saved,text:saved?targetName+" appointed "+newRole+" across all rooms. Give them the staff password privately.":"Could not save the staff role."}));
+      const action = String(data.action || "");
+      const isOwner = !!this.env.OWNER_SECRET && String(data.secret || "") === this.env.OWNER_SECRET;
+      const role = attachment.role || "member";
+      const isStaff = role === "admin" || role === "moderator";
+      if (action === "login") {
+        socket.send(JSON.stringify({ type: "adminResult", ok: isOwner, text: isOwner ? "Owner login successful." : "Owner login failed." }));
         return;
       }
-
-      const targetSocket=this.ctx.getWebSockets().find(ws=>(ws.deserializeAttachment()||{}).peerId===String(data.target||""));
-      if(!targetSocket){socket.send(JSON.stringify({type:"adminResult",ok:false,text:"That member is no longer connected."}));return;}
-      const targetAttachment=targetSocket.deserializeAttachment()||{};
-      if(!isOwner&&["owner","admin","moderator"].includes(targetAttachment.role)){
-        socket.send(JSON.stringify({type:"adminResult",ok:false,text:"Staff cannot moderate another staff member."}));return;
+      if (!isOwner && !isStaff) {
+        socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "You do not have permission to use that control." }));
+        return;
       }
-      if(action==="kick"){
-        try{targetSocket.send(JSON.stringify({type:"kicked",text:"You were removed from this room by room staff."}));targetSocket.close(4001,"Removed by room staff");}catch{}
-        this.broadcast({type:"notice",text:(targetAttachment.username||"A member")+" was removed by room staff."});
-        this.sendUsers();socket.send(JSON.stringify({type:"adminResult",ok:true,text:"Member removed."}));return;
+      if (action === "clear") {
+        if (!isOwner) {
+          socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "Only the owner can clear chat history." }));
+          return;
+        }
+        await this.ctx.storage.put("history", []);
+        this.broadcast({ type: "clear" });
+        socket.send(JSON.stringify({ type: "adminResult", ok: true, text: "This room's chat history was cleared." }));
+        return;
       }
-      if(action==="mute"||action==="unmute"){
-        targetAttachment.muted=action==="mute";targetSocket.serializeAttachment(targetAttachment);
-        targetSocket.send(JSON.stringify({type:"notice",text:action==="mute"?"You are muted by room staff.":"You were unmuted by room staff."}));
-        this.sendUsers();socket.send(JSON.stringify({type:"adminResult",ok:true,text:action==="mute"?"Member muted.":"Member unmuted."}));
+      if (action === "assignRole" || action === "removeRole") {
+        if (!isOwner) {
+          socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "Only the owner can manage staff roles." }));
+          return;
+        }
+        const targetName = normalizeUser(data.username);
+        if (!targetName) {
+          socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "Enter a username." }));
+          return;
+        }
+        if (action === "removeRole") {
+          const removed = await this.deleteGlobalRole(targetName);
+          socket.send(JSON.stringify({ type: "adminResult", ok: removed, text: removed ? "Staff role removed for " + targetName + " across all rooms." : "Could not remove that staff role." }));
+          return;
+        }
+        const newRole = String(data.role || "");
+        const staffPassword = String(data.staffPassword || "");
+        if (!["admin", "moderator"].includes(newRole) || staffPassword.length < 8) {
+          socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "Choose Admin or Moderator and enter a staff password of at least 8 characters." }));
+          return;
+        }
+        const salt = crypto.randomUUID() + crypto.randomUUID();
+        const saved = await this.saveGlobalRole(targetName, { role: newRole, salt, passwordHash: await hashStaffPassword(staffPassword, salt) });
+        socket.send(JSON.stringify({ type: "adminResult", ok: saved, text: saved ? targetName + " appointed " + newRole + " across all rooms. Give them the staff password privately." : "Could not save the staff role." }));
+        return;
+      }
+      const targetSocket = this.ctx.getWebSockets().find((ws) => (ws.deserializeAttachment() || {}).peerId === String(data.target || ""));
+      if (!targetSocket) {
+        socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "That member is no longer connected." }));
+        return;
+      }
+      const targetAttachment = targetSocket.deserializeAttachment() || {};
+      if (!isOwner && ["owner", "admin", "moderator"].includes(targetAttachment.role)) {
+        socket.send(JSON.stringify({ type: "adminResult", ok: false, text: "Staff cannot moderate another staff member." }));
+        return;
+      }
+      if (action === "kick") {
+        try {
+          targetSocket.send(JSON.stringify({ type: "kicked", text: "You were removed from this room by room staff." }));
+          targetSocket.close(4001, "Removed by room staff");
+        } catch {
+        }
+        this.broadcast({ type: "notice", text: (targetAttachment.username || "A member") + " was removed by room staff." });
+        this.sendUsers();
+        socket.send(JSON.stringify({ type: "adminResult", ok: true, text: "Member removed." }));
+        return;
+      }
+      if (action === "mute" || action === "unmute") {
+        targetAttachment.muted = action === "mute";
+        targetSocket.serializeAttachment(targetAttachment);
+        targetSocket.send(JSON.stringify({ type: "notice", text: action === "mute" ? "You are muted by room staff." : "You were unmuted by room staff." }));
+        this.sendUsers();
+        socket.send(JSON.stringify({ type: "adminResult", ok: true, text: action === "mute" ? "Member muted." : "Member unmuted." }));
       }
     }
   }
-
   async getGlobalRole(username) {
     try {
-      const id=this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
-      const response=await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles?username="+encodeURIComponent(normalizeUser(username)),{
-        headers:{"X-Owner-Secret":this.env.OWNER_SECRET||""}
+      const id = this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
+      const response = await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles?username=" + encodeURIComponent(normalizeUser(username)), {
+        headers: { "X-Owner-Secret": this.env.OWNER_SECRET || "" }
       });
-      return response.ok?await response.json():null;
-    } catch { return null; }
+      return response.ok ? await response.json() : null;
+    } catch {
+      return null;
+    }
   }
-
-  async saveGlobalRole(username,record) {
+  async saveGlobalRole(username, record) {
     try {
-      const id=this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
-      const response=await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles",{
-        method:"POST",
-        headers:{"Content-Type":"application/json","X-Owner-Secret":this.env.OWNER_SECRET||""},
-        body:JSON.stringify({username,...record})
+      const id = this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
+      const response = await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Owner-Secret": this.env.OWNER_SECRET || "" },
+        body: JSON.stringify({ username, ...record })
       });
       return response.ok;
-    } catch { return false; }
+    } catch {
+      return false;
+    }
   }
-
   async deleteGlobalRole(username) {
     try {
-      const id=this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
-      const response=await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles?username="+encodeURIComponent(normalizeUser(username)),{
-        method:"DELETE",
-        headers:{"X-Owner-Secret":this.env.OWNER_SECRET||""}
+      const id = this.env.CHAT_ROOMS.idFromName("__MR_UNKNOWN_GLOBAL_STAFF_ROLES__");
+      const response = await this.env.CHAT_ROOMS.get(id).fetch("https://internal/_roles?username=" + encodeURIComponent(normalizeUser(username)), {
+        method: "DELETE",
+        headers: { "X-Owner-Secret": this.env.OWNER_SECRET || "" }
       });
       return response.ok;
-    } catch { return false; }
+    } catch {
+      return false;
+    }
   }
-
   webSocketClose(socket) {
     const attachment = socket.deserializeAttachment() || {};
     this.broadcast({
@@ -236,39 +262,37 @@ export class ChatRoom {
     }, socket);
     this.sendUsers();
   }
-
   webSocketError(socket) {
-    try { socket.close(); } catch {}
+    try {
+      socket.close();
+    } catch {
+    }
     this.sendUsers();
   }
-
   broadcast(data, except = null) {
     const payload = JSON.stringify(data);
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === except) continue;
       try {
         if (socket.readyState === WebSocket.OPEN) socket.send(payload);
-      } catch {}
+      } catch {
+      }
     }
   }
-
   sendUsers() {
-    const users = this.ctx.getWebSockets()
-      .filter(socket => socket.readyState === WebSocket.OPEN)
-      .map(socket => {
-        const a = socket.deserializeAttachment() || {};
-        return {
-          id: a.peerId,
-          username: a.username || "Guest",
-          muted: !!a.muted,
-          role: a.role || "member"
-        };
-      });
+    const users = this.ctx.getWebSockets().filter((socket) => socket.readyState === WebSocket.OPEN).map((socket) => {
+      const a = socket.deserializeAttachment() || {};
+      return {
+        id: a.peerId,
+        username: a.username || "Guest",
+        muted: !!a.muted,
+        role: a.role || "member"
+      };
+    });
     this.broadcast({ type: "users", users });
   }
-}
-
-const HTML = `<!DOCTYPE html>
+};
+var HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -350,6 +374,17 @@ footer{text-align:center;padding:25px;color:#aaa;font-size:12px}
 <button class="btn" onclick="stopMedia()">STOP WEBCAM & MIC</button>
 <p class="small" id="mediaStatus">Camera and microphone are off.</p>
 <div class="video-grid" id="localVideoGrid"></div>
+<hr style="border:0;border-top:1px solid #700;margin:22px 0">
+<h2>🎧 DJ MUSIC MODE</h2>
+<p>Share sound from a browser tab (such as Spotify Web Player or YouTube) while keeping your microphone on. Other people in this room can hear the mixed audio.</p>
+<button class="btn" id="djStart" onclick="startDJ()">SHARE BROWSER MUSIC</button>
+<button class="btn" id="djStop" onclick="stopDJ()" disabled>STOP DJ MUSIC</button>
+<p class="small" id="djStatus">DJ Music Mode is off.</p>
+<label for="micVolume" class="small">MICROPHONE VOLUME</label>
+<input id="micVolume" type="range" min="0" max="1.5" step="0.05" value="1" oninput="setDJVolume()">
+<label for="musicVolume" class="small">MUSIC VOLUME</label>
+<input id="musicVolume" type="range" min="0" max="1.5" step="0.05" value="0.8" oninput="setDJVolume()">
+<p class="small">How to use: Start your mic first, click SHARE BROWSER MUSIC, choose the Spotify/YouTube browser tab in the sharing window, and turn on “Share tab audio” if shown. This works only when the browser and streaming service allow tab audio capture. Some protected streams may block sharing.</p>
 <p class="small">Your browser will ask permission. Use HTTPS and allow camera/microphone access. Video calls use a peer-to-peer connection; some networks may require a TURN service for reliable connections.</p>
 </section>
 
@@ -381,17 +416,19 @@ footer{text-align:center;padding:25px;color:#aaa;font-size:12px}
 </div>
 </section>
 </main>
-<footer>MR UNKNOWN'S CHAT PARADISE<br>© 2026 - ALL RIGHTS RESERVED</footer>
+<footer>MR UNKNOWN'S CHAT PARADISE<br>\xA9 2026 - ALL RIGHTS RESERVED</footer>
 
 <script>
 let currentUser="",currentRoom="Welcome Lounge",socket=null,peerId=null;
 let localStream=null,ownerSecret="",currentRole="member",members=[],peerConnections=new Map();
+let djCaptureStream=null,djAudioContext=null,djMicGain=null,djMusicGain=null,djMixedTrack=null;
 const roomNames=["Welcome Lounge","General Chat","Music Lounge","Horror Movie Zone","Country Corner","Private Hangout","Members Lounge"];
 const rtcConfig={iceServers:[{urls:"stun:stun.l.google.com:19302"}]};
 
 function showSection(id){
 ["home","rooms","media","admin"].forEach(name=>document.getElementById(name).classList.add("hidden"));
 document.getElementById(id).classList.remove("hidden");
+if(localStream)renderLocalVideoTiles();
 }
 function enterChat(){
 const name=document.getElementById("username").value.trim();
@@ -418,27 +455,11 @@ const box=document.getElementById("messages");box.appendChild(line);box.scrollTo
 function selectRoom(room){
 currentRoom=room;document.getElementById("roomTitle").textContent=room;
 document.getElementById("messages").replaceChildren();document.getElementById("memberList").replaceChildren();
-document.getElementById("videoGrid").replaceChildren();if(localStream){
-  const tile=document.createElement("div");
-  tile.className="video-tile";
-  tile.id="local-video";
-  tile.style.border="3px solid #22c55e";
-
-  const video=document.createElement("video");
-  video.autoplay=true;
-  video.muted=true;
-  video.playsInline=true;
-  video.srcObject=localStream;
-
-  const label=document.createElement("p");
-  label.textContent=currentUser+" (YOU) ● LIVE";
-  label.style.color="#22c55e";
-
-  tile.append(video,label);
-  document.getElementById("videoGrid").appendChild(tile);
-}
+document.getElementById("videoGrid").replaceChildren();
+document.getElementById("localVideoGrid").replaceChildren();
 document.querySelectorAll("#roomList .room").forEach((item,index)=>item.classList.toggle("active",roomNames[index]===room));
 closePeers();
+renderLocalVideoTiles();
 if(socket){socket.onclose=null;socket.close();socket=null;}
 connectRoom();
 }
@@ -447,7 +468,7 @@ const protocol=location.protocol==="https:"?"wss:":"ws:";
 const url=protocol+"//"+location.host+"/ws?room="+encodeURIComponent(currentRoom)+"&username="+encodeURIComponent(currentUser);
 socket=new WebSocket(url);
 socket.onopen=()=>{
-document.getElementById("connection").textContent="● Connected to "+currentRoom;
+document.getElementById("connection").textContent="\u25CF Connected to "+currentRoom;
 const pw=document.getElementById("staffPassword").value;
 if(pw)socket.send(JSON.stringify({type:"authRole",password:pw}));
 };
@@ -500,7 +521,7 @@ function renderMembers(){
 const list=document.getElementById("memberList");list.replaceChildren();
 members.forEach(member=>{
 const line=document.createElement("p");line.className="status";
-line.textContent="● "+member.username+(member.role!=="member"?" ["+member.role+"]":"")+(member.muted?" (muted)":"");
+line.textContent="\u25CF "+member.username+(member.role!=="member"?" ["+member.role+"]":"")+(member.muted?" (muted)":"");
 list.appendChild(line);
 });
 renderAdminMembers();
@@ -515,7 +536,11 @@ document.getElementById("videoGrid").replaceChildren();
 }
 function makePeer(member){
 const pc=new RTCPeerConnection(rtcConfig);peerConnections.set(member.id,pc);
-if(localStream)localStream.getTracks().forEach(track=>pc.addTrack(track,localStream));
+if(localStream){
+  const outboundAudio=djMixedTrack||localStream.getAudioTracks()[0];
+  if(outboundAudio)pc.addTrack(outboundAudio,localStream);
+  localStream.getVideoTracks().forEach(track=>pc.addTrack(track,localStream));
+}
 pc.onicecandidate=e=>{if(e.candidate)sendSignal(member.id,{candidate:e.candidate});};
 pc.ontrack=e=>showRemoteVideo(member.id,member.username,e.streams[0]);
 pc.onconnectionstatechange=()=>{if(["failed","closed","disconnected"].includes(pc.connectionState))removeRemoteVideo(member.id);};
@@ -541,6 +566,42 @@ const label=document.createElement("p");label.textContent=name;tile.append(video
 tile.querySelector("video").srcObject=stream;
 }
 function removeRemoteVideo(id){const tile=document.getElementById("peer-"+id);if(tile)tile.remove();}
+function renderLocalVideoTiles(){
+  const containers=[
+    document.getElementById("videoGrid"),
+    document.getElementById("localVideoGrid")
+  ];
+  containers.forEach((container)=>{
+    if(!container)return;
+    const old=container.querySelector("#local-video");
+    if(old)old.remove();
+    if(!localStream)return;
+
+    const tile=document.createElement("div");
+    tile.className="video-tile";
+    tile.id="local-video";
+    tile.style.border="3px solid #22c55e";
+
+    const video=document.createElement("video");
+    video.autoplay=true;
+    video.muted=true;
+    video.playsInline=true;
+    video.srcObject=localStream;
+
+    const label=document.createElement("p");
+    label.textContent=currentUser+" (YOU) \u25CF LIVE";
+    label.style.color="#22c55e";
+
+    const meter=document.createElement("p");
+    meter.textContent="Microphone active";
+    meter.style.color="#22c55e";
+
+    tile.append(video,label,meter);
+    container.appendChild(tile);
+    video.play().catch(()=>{});
+  });
+}
+
 async function handleSignal(from,signal){
 let pc=peerConnections.get(from);
 const member=members.find(m=>m.id===from)||{id:from,username:"Member"};
@@ -561,60 +622,146 @@ async function startMedia(){
     return;
   }
 
+  if(localStream){
+    renderLocalVideoTiles();
+    document.getElementById("mediaStatus").textContent=
+      "Your webcam and microphone are on in "+currentRoom+".";
+    return;
+  }
+
   try{
     localStream=await navigator.mediaDevices.getUserMedia({
       audio:true,
       video:true
     });
 
-    const tile=document.createElement("div");
-    tile.className="video-tile";
-    tile.style.border="3px solid #22c55e";
-    tile.id="local-video";
-
-    const video=document.createElement("video");
-    video.autoplay=true;
-    video.muted=true;
-    video.playsInline=true;
-    video.srcObject=localStream;
-
-    const label=document.createElement("p");
-    label.textContent=currentUser+" (YOU) ● LIVE";
-    label.style.color="#22c55e";
-
-    const meter=document.createElement("p");
-    meter.textContent="Microphone active";
-    meter.id="localMicMeter";
-
-    tile.append(video,label,meter);
-    document.getElementById("videoGrid").appendChild(tile);
+    // Show the local camera in BOTH the chatroom and Webcam & Mic tab.
+    renderLocalVideoTiles();
 
     document.getElementById("mediaStatus").textContent=
       "Your webcam and microphone are on in "+currentRoom+".";
 
+    // Share the newly started camera/microphone with peers already in this room.
     for(const [id,pc] of peerConnections){
-      for(const track of localStream.getTracks()){
-        try{pc.addTrack(track,localStream);}catch{}
-      }
       try{
+        const existingSenders=pc.getSenders();
+        const audioTrack=djMixedTrack||localStream.getAudioTracks()[0];
+        if(audioTrack&&!existingSenders.some(sender=>sender.track&&sender.track.kind==="audio")){
+          pc.addTrack(audioTrack,localStream);
+        }
+        for(const track of localStream.getVideoTracks()){
+          if(!existingSenders.some(sender=>sender.track&&sender.track.kind==="video")){
+            pc.addTrack(track,localStream);
+          }
+        }
         const offer=await pc.createOffer();
         await pc.setLocalDescription(offer);
         sendSignal(id,{description:pc.localDescription});
       }catch(err){
-        console.error(err);
+        console.error("Could not share camera with member",id,err);
       }
     }
-
   }catch(e){
+    if(localStream){
+      localStream.getTracks().forEach(track=>track.stop());
+      localStream=null;
+    }
+    renderLocalVideoTiles();
     document.getElementById("mediaStatus").textContent=
       "Could not start camera/microphone. Check permissions.";
     alert("Camera or microphone permission was not granted.");
   }
+}
+async function startDJ(){
+  if(!localStream || !localStream.getAudioTracks().some(track=>track.readyState==="live")){
+    alert("Start your webcam and microphone first, then start DJ Music Mode.");
+    return;
+  }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia){
+    alert("Your browser does not support browser-tab audio sharing. Try a recent version of Chrome or Edge.");
+    return;
+  }
+  if(djCaptureStream){
+    document.getElementById("djStatus").textContent="DJ Music Mode is already running.";
+    return;
+  }
+  try{
+    // The browser prompts the DJ to choose a tab/window/screen. Tab audio must be enabled in the picker.
+    djCaptureStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});
+    const tabAudioTracks=djCaptureStream.getAudioTracks();
+    if(!tabAudioTracks.length){
+      djCaptureStream.getTracks().forEach(track=>track.stop());
+      djCaptureStream=null;
+      document.getElementById("djStatus").textContent="No shared tab audio detected. Try again and enable Share tab audio.";
+      alert("No tab audio was shared. In the sharing window, choose a browser tab and enable Share tab audio.");
+      return;
+    }
+    const AudioContextClass=window.AudioContext||window.webkitAudioContext;
+    if(!AudioContextClass)throw new Error("Web Audio is not supported in this browser.");
+    djAudioContext=new AudioContextClass();
+    await djAudioContext.resume();
+    const destination=djAudioContext.createMediaStreamDestination();
+    const micTrack=localStream.getAudioTracks().find(track=>track.readyState==="live");
+    const micSource=djAudioContext.createMediaStreamSource(new MediaStream([micTrack]));
+    const musicSource=djAudioContext.createMediaStreamSource(new MediaStream([tabAudioTracks[0]]));
+    djMicGain=djAudioContext.createGain();
+    djMusicGain=djAudioContext.createGain();
+    djMicGain.gain.value=Number(document.getElementById("micVolume").value);
+    djMusicGain.gain.value=Number(document.getElementById("musicVolume").value);
+    micSource.connect(djMicGain).connect(destination);
+    musicSource.connect(djMusicGain).connect(destination);
+    djMixedTrack=destination.stream.getAudioTracks()[0];
+    // Replace the already-published microphone track without restarting each video call.
+    for(const pc of peerConnections.values()){
+      const sender=pc.getSenders().find(item=>item.track&&item.track.kind==="audio");
+      if(sender)await sender.replaceTrack(djMixedTrack);
+    }
+    const displayVideo=djCaptureStream.getVideoTracks()[0];
+    if(displayVideo)displayVideo.onended=()=>stopDJ();
+    tabAudioTracks[0].onended=()=>stopDJ();
+    document.getElementById("djStatus").textContent="DJ Music Mode is LIVE. Your mic and shared tab audio are being sent to this room.";
+    document.getElementById("djStart").disabled=true;
+    document.getElementById("djStop").disabled=false;
+  }catch(error){
+    console.error("DJ sharing error",error);
+    stopDJ();
+    document.getElementById("djStatus").textContent="Could not start DJ sharing. Check browser permissions and try again.";
+    alert("Could not start DJ Music Mode. Choose a browser tab and allow tab audio sharing.");
+  }
+}
+function setDJVolume(){
+  if(djMicGain)djMicGain.gain.value=Number(document.getElementById("micVolume").value);
+  if(djMusicGain)djMusicGain.gain.value=Number(document.getElementById("musicVolume").value);
+}
+function stopDJ(){
+  const oldCapture=djCaptureStream;
+  djCaptureStream=null;
+  if(oldCapture)oldCapture.getTracks().forEach(track=>{track.onended=null;try{track.stop();}catch(e){}});
+  const micTrack=localStream&&localStream.getAudioTracks().find(track=>track.readyState==="live");
+  const replacement=micTrack||null;
+  for(const pc of peerConnections.values()){
+    const sender=pc.getSenders().find(item=>item.track&&item.track.kind==="audio");
+    if(sender)sender.replaceTrack(replacement).catch(error=>console.warn("Could not restore microphone track",error));
+  }
+  djMixedTrack=null;
+  if(djAudioContext){djAudioContext.close().catch(()=>{});djAudioContext=null;}
+  djMicGain=null;djMusicGain=null;
+  const status=document.getElementById("djStatus");
+  if(status)status.textContent="DJ Music Mode is off.";
+  const start=document.getElementById("djStart"),stop=document.getElementById("djStop");
+  if(start)start.disabled=false;
+  if(stop)stop.disabled=true;
+}
 function stopMedia(){
-if(localStream){localStream.getTracks().forEach(track=>track.stop());localStream=null;}
-document.getElementById("localVideoGrid").replaceChildren();
-document.getElementById("mediaStatus").textContent="Camera and microphone are off.";
-closePeers();if(peerId)updatePeerConnections();
+  stopDJ();
+  if(localStream){
+    localStream.getTracks().forEach(track=>track.stop());
+    localStream=null;
+  }
+  renderLocalVideoTiles();
+  document.getElementById("mediaStatus").textContent="Camera and microphone are off.";
+  closePeers();
+  if(peerId)updatePeerConnections();
 }
 function adminLogin(){
 ownerSecret=document.getElementById("ownerSecret").value;
@@ -660,13 +807,17 @@ const box=document.getElementById("adminMembers");if(!box)return;box.replaceChil
 if(currentRole==="member")return;
 members.filter(m=>m.id!==peerId).forEach(member=>{
 const row=document.createElement("div");row.className="room";
-const name=document.createElement("strong");name.textContent=member.username+" — "+(member.role||"member")+(member.muted?" (muted)":"");row.appendChild(name);
+const name=document.createElement("strong");name.textContent=member.username+" \u2014 "+(member.role||"member")+(member.muted?" (muted)":"");row.appendChild(name);
 const kick=document.createElement("button");kick.className="btn";kick.textContent="KICK";kick.onclick=()=>{if(confirm("Remove "+member.username+" from this room?"))adminSend("kick",member.id);};
 const mute=document.createElement("button");mute.className="btn";mute.textContent=member.muted?"UNMUTE":"MUTE";mute.onclick=()=>adminSend(member.muted?"unmute":"mute",member.id);
 row.append(kick,mute);box.appendChild(row);
 });
 }
 window.addEventListener("beforeunload",()=>{stopMedia();if(socket)socket.close();});
-</script>
+<\/script>
 </body>
 </html>`;
+export {
+  ChatRoom,
+  worker_default as default
+};
